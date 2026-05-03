@@ -130,7 +130,7 @@
 # =============================================================================
 
 - name: Deploy honeypot files
-  ansible.builtin.include_tasks: honeypot.yml
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/honeypot.yml"
   when: "'honeypot' in _files_active_modes and ludus_honeypot_enabled | default(true) | bool"
 
 # =============================================================================
@@ -138,7 +138,7 @@
 # =============================================================================
 
 - name: Deploy breadcrumbs
-  ansible.builtin.include_tasks: breadcrumbs.yml
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/breadcrumbs.yml"
   when: "'breadcrumbs' in _files_active_modes and ludus_breadcrumbs_enabled | default(true) | bool"
 
 # =============================================================================

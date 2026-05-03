@@ -15,8 +15,8 @@ ludus_misconfigs_mode: "custom"
 ludus_misconfigs_hostname_override: ""
 
 # Domain information (auto-detected from Ludus when possible)
-ludus_misconfigs_domain: "{{ (ludus | selectattr('vm_name', 'match', inventory_hostname))[0].domain.fqdn | default('') }}"
-ludus_misconfigs_domain_netbios: "{{ ludus_misconfigs_domain.split('.')[0] | upper }}"
+ludus_misconfigs_domain: "{{ ludus_domain_fqdn | default('') }}"
+ludus_misconfigs_domain_netbios: "{{ ludus_domain_netbios_name | default(ludus_misconfigs_domain.split('.')[0] | upper) }}"
 
 # ============================================================================
 # FIREWALL SETTINGS

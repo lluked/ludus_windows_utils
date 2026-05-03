@@ -84,14 +84,16 @@
       }
 
       # Create GPO if it doesn't exist
+      $changed = $false
       $gpo = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
       if (-not $gpo) {
         $gpo = New-GPO -Name $GpoName -Comment "LAPS GPO managed by Ansible"
         New-GPLink -Name $GpoName -Target $LapsOU -Enforced Yes
         Write-Output "Created and linked GPO: $GpoName"
+        $changed = $true
       }
 
-      # Configure GPO registry settings
+      # Configure GPO registry settings (Set-GPRegistryValue is idempotent by value)
       Set-GPRegistryValue -Name $GpoName `
         -Key "HKLM\Software\Policies\Microsoft Services\AdmPwd" `
         -ValueName "AdmPwdEnabled" -Type DWord -Value 1
@@ -105,7 +107,7 @@
         -Key "HKLM\Software\Policies\Microsoft Services\AdmPwd" `
         -ValueName "PasswordAgeDays" -Type DWord -Value 30
 
-      $Ansible.Changed = $true
+      $Ansible.Changed = $changed
     parameters:
       LapsOU: "{{ ludus_laps_ou }}"
       GpoName: "{{ ludus_laps_gpo_name }}"

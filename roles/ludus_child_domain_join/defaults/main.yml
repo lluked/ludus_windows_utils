@@ -2,23 +2,27 @@
 # ludus_child_domain_join - Default Variables
 #
 # Required variables (must be set in role_vars):
-#   ludus_child_domain_fqdn  - The FQDN of the child domain to join (e.g., north.sevenkingdoms.local)
-#   ludus_child_dc_ip        - The IP address of the child domain DC
+#   ludus_child_domain_fqdn    - FQDN of the child domain (e.g., north.sevenkingdoms.local)
+#   ludus_child_dc_ip          - IP of the child domain DC (for DNS + port checks)
+#   ludus_child_dc_hostname    - Short (NetBIOS) hostname of the child DC (e.g., winterfell)
+#                                Used as domain_server to force Kerberos over NTLM.
+#                                IMPORTANT: Use SHORT hostname, not FQDN.
+#                                The FQDN resolves to an IP triggering NTLM which is blocked
+#                                on Win2022 DCs (NTLM loopback protection). The short name
+#                                uses NetBIOS which bypasses this restriction.
 
-# Child domain FQDN to join (e.g., "north.sevenkingdoms.local")
+# Child domain FQDN to join
 ludus_child_domain_fqdn: ""
 
-# Child domain DC IP address (for DNS)
+# Child domain DC IP (for DNS configuration and port readiness checks)
 ludus_child_dc_ip: ""
 
-# Optional overrides - defaults to Ludus defaults if not specified
-# Uses CHILD domain admin credentials (NOT parent/Enterprise Admin).
-# This avoids cross-domain NTLM forwarding issues when ludus_ad_anonymous_rpc
-# has been applied on the child DC.
-# ludus_domain_admin_user: "domainadmin@north.sevenkingdoms.local"
-# ludus_domain_admin_password: "password"
+# Child domain DC short (NetBIOS) hostname — forces Kerberos for the join.
+# e.g. 'winterfell' (NOT 'winterfell.north.sevenkingdoms.local')
+ludus_child_dc_hostname: ""
 
-# DEPRECATED — ludus_parent_domain_fqdn is no longer used.
-# The role now uses child domain creds by default. Kept for backward compat
-# but has no effect unless ludus_domain_admin_user is explicitly set.
-ludus_parent_domain_fqdn: ""
+# Domain admin credentials for the child domain.
+# Must be the built-in Administrator (password: 'password' — Ludus default).
+# Named domain admin accounts fail on Win2022 due to NTLM loopback restrictions.
+# ludus_domain_admin_user: "administrator@north.sevenkingdoms.local"
+# ludus_domain_admin_password: "password"

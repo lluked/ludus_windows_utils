@@ -62,6 +62,7 @@
     type: multistring
     state: present
   register: _null_pipes
+  notify: restart lanmanserver
   when: ludus_anonymous_named_pipes | length > 0
 
 - name: Configure RestrictNullSessAccess to allow null sessions
@@ -72,6 +73,7 @@
     type: dword
     state: present
   register: _restrict_null
+  notify: restart lanmanserver
 
 # RestrictRemoteSAM — Windows Server 2016+ / Windows 10 1607+
 # This SDDL-based registry value gates ALL remote SAM/LSA queries independently
@@ -181,15 +183,6 @@
 # =============================================================================
 # RESTART SERVICES
 # =============================================================================
-
-- name: Restart LanmanServer service if registry changed
-  ansible.windows.win_service:
-    name: LanmanServer
-    state: restarted
-    force_dependent_services: true
-  when: >
-    (_null_pipes.changed | default(false)) or
-    (_restrict_null.changed | default(false))
 
 # LSA registry changes (RestrictAnonymous, RestrictAnonymousSAM, EveryoneIncludesAnonymous,
 # LSAAnonymousNameLookup) require a full Windows reboot to take effect.

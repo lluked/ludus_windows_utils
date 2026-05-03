@@ -379,6 +379,7 @@ ludus_goad_data:
           - "Night Watch"
         spns:
           - "HTTP/thewall.north.sevenkingdoms.local"
+          - "CIFS/thewall.north.sevenkingdoms.local"
         password_never_expires: true
 
       - name: samwell.tarly

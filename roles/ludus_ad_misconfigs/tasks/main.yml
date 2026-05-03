@@ -497,6 +497,27 @@
 # ACCOUNT NOT DELEGATED (Sensitive)
 # ============================================================================
 
+# Wait for KDC to stabilize after delegation changes.
+# Setting TrustedToAuthForDelegation / msDS-AllowedToDelegateTo triggers a
+# KDC policy reload on the DC. If a downstream role (e.g. ludus_child_domain_join)
+# fires immediately via depends_on, NetJoinDomain hits the DC during this refresh
+# window and fails with "The specified network name is no longer available".
+# A short replication sync + pause ensures the KDC is fully settled before
+# any dependent roles attempt to authenticate against this DC.
+- name: Wait for KDC to stabilize after delegation changes
+  ansible.windows.win_powershell:
+    script: |
+      if ((Get-Service ADWS -ErrorAction SilentlyContinue).Status -eq 'Running') {
+          repadmin /syncall /AdeP 2>&1 | Out-Null
+          Start-Sleep -Seconds 15
+          Write-Output "KDC stabilization complete"
+      }
+      $Ansible.Changed = $false
+  changed_when: false
+  when: >
+    (ludus_constrained_delegation_any | length > 0) or
+    (ludus_constrained_delegation_kerb_only | length > 0)
+
 - name: Configure accounts as sensitive (cannot be delegated)
   when: ludus_account_not_delegated | length > 0
   block:
@@ -717,7 +738,7 @@
 - name: Disable SMB signing for relay attacks
   when: ludus_smb_signing_disabled | default(false) | bool
   block:
-    - name: Disable SMB signing requirement (server)
+    - name: Disable SMB signing requirement (server registry)
       ansible.windows.win_regedit:
         path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
         name: RequireSecuritySignature
@@ -725,7 +746,7 @@
         type: dword
         state: present
 
-    - name: Disable SMB signing requirement (client)
+    - name: Disable SMB signing requirement (client registry)
       ansible.windows.win_regedit:
         path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters
         name: RequireSecuritySignature
@@ -733,13 +754,54 @@
         type: dword
         state: present
 
-    - name: Disable SMB signing (server EnableSecuritySignature)
+    - name: Disable SMB signing (server EnableSecuritySignature registry)
       ansible.windows.win_regedit:
         path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
         name: EnableSecuritySignature
         data: 0
         type: dword
         state: present
+
+    # On Domain Controllers, the Default Domain Controllers Policy GPO overrides
+    # registry settings for SMB signing. Override it by editing the GptTmpl.inf
+    # in SYSVOL directly and forcing a gpupdate.
+    - name: Disable SMB signing in Default DC Policy GPO (DC only)
+      ansible.windows.win_powershell:
+        script: |
+          $role = (Get-WmiObject Win32_ComputerSystem).DomainRole
+          # DomainRole 4=BackupDC 5=PrimaryDC — only run on DCs
+          if ($role -lt 4) {
+            Write-Output "Not a DC — skipping GPO edit"
+            $Ansible.Changed = $false
+            return
+          }
+          $gpoGuid = "{6AC1786C-016F-11D2-945F-00C04fB984F9}"
+          $domain = (Get-ADDomain).DNSRoot
+          $gptFile = "C:\Windows\SYSVOL\sysvol\$domain\Policies\$gpoGuid\Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
+          if (-not (Test-Path $gptFile)) {
+            Write-Output "GptTmpl.inf not found at $gptFile — skipping"
+            $Ansible.Changed = $false
+            return
+          }
+          $content = Get-Content $gptFile -Raw
+          $modified = $content.Replace(
+            "MACHINE\System\CurrentControlSet\Services\LanManServer\Parameters\RequireSecuritySignature=4,1",
+            "MACHINE\System\CurrentControlSet\Services\LanManServer\Parameters\RequireSecuritySignature=4,0"
+          ).Replace(
+            "MACHINE\System\CurrentControlSet\Services\LanManServer\Parameters\EnableSecuritySignature=4,1",
+            "MACHINE\System\CurrentControlSet\Services\LanManServer\Parameters\EnableSecuritySignature=4,0"
+          )
+          if ($modified -ne $content) {
+            Set-Content $gptFile -Value $modified -Encoding Unicode
+            gpupdate /force | Out-Null
+            Write-Output "GPO SMB signing disabled and gpupdate applied"
+            $Ansible.Changed = $true
+          } else {
+            Write-Output "GPO already has SMB signing disabled"
+            $Ansible.Changed = $false
+          }
+      changed_when: "'disabled and gpupdate' in _smb_gpo_result.output | default([])"
+      register: _smb_gpo_result
 
     - name: Log SMB signing disabled
       ansible.builtin.debug:
@@ -802,6 +864,28 @@
           }
       when: _webclient_feature.reboot_required | default(false)
       register: _secure_channel_result
+
+    # After the reboot, TCP ports (88, 389, 445) answer quickly but the Netlogon
+    # authentication stack — which authenticates net use \\DC\NETLOGON — takes
+    # longer. Any downstream role (e.g. ludus_child_domain_join on a member server)
+    # that depends_on this role completing will attempt that SMB auth check
+    # immediately. We prove Netlogon is ready here so depends_on is a genuine gate.
+    - name: Wait for Netlogon SMB auth stack to be ready after reboot
+      ansible.windows.win_powershell:
+        script: |
+          $svc = Get-Service -Name Netlogon -ErrorAction SilentlyContinue
+          if ($svc -and $svc.Status -eq 'Running') {
+              Write-Output "Netlogon service is running"
+              $Ansible.Changed = $false
+          } else {
+              throw "Netlogon service is not yet running"
+          }
+      register: _netlogon_ready
+      until: _netlogon_ready is succeeded
+      retries: 20
+      delay: 15
+      changed_when: false
+      when: _webclient_feature.reboot_required | default(false)
 
     - name: Ensure WebClient service is running
       ansible.windows.win_service:

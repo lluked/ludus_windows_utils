@@ -308,6 +308,11 @@
 # =============================================================================
 # SERVICE PRINCIPAL NAMES (using microsoft.ad.user)
 # =============================================================================
+# NOTE: ignore_errors is set because SPNs for service accounts (e.g., sql_svc)
+# may already be registered forest-wide by the service itself (e.g., SQL Server
+# auto-registers MSSQLSvc SPNs at install time). This causes "SPN not unique
+# forest-wide" errors when bulk_ad_content runs after the service is installed.
+# The user is created correctly; the SPN conflict is a known idempotency edge case.
 - name: Set Service Principal Names on users
   microsoft.ad.user:
     name: "{{ item.name }}"
@@ -318,6 +323,7 @@
   loop_control:
     label: "{{ item.name }}"
   when: _ludus_ad_data.users is defined
+  ignore_errors: true
 
 # =============================================================================
 # SET MANAGED_BY ON GROUPS (now that users exist)

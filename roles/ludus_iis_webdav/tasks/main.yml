@@ -179,33 +179,38 @@
 - name: Enable WebDAV authoring on Default Web Site
   ansible.windows.win_powershell:
     script: |
-      # Enable WebDAV authoring globally on the Default Web Site
       $appcmd = "$env:SystemRoot\System32\inetsrv\appcmd.exe"
 
       # Unlock the WebDAV section at the server level first
       & $appcmd unlock config -section:system.webServer/webdav/authoring -commit:apphost 2>&1 | Out-Null
       & $appcmd unlock config -section:system.webServer/webdav/authoringRules -commit:apphost 2>&1 | Out-Null
 
-      # Enable WebDAV authoring on Default Web Site
-      & $appcmd set config "Default Web Site" `
-        -section:system.webServer/webdav/authoring `
-        /enabled:true `
-        /requireSsl:false 2>&1 | Out-Null
+      # Check current WebDAV authoring state
+      $current = & $appcmd list config "Default Web Site" -section:system.webServer/webdav/authoring 2>&1
+      if ($current -match 'enabled="true"') {
+        Write-Output "WebDAV authoring already enabled on Default Web Site"
+        $Ansible.Changed = $false
+      } else {
+        # Enable WebDAV authoring on Default Web Site
+        & $appcmd set config "Default Web Site" `
+          -section:system.webServer/webdav/authoring `
+          /enabled:true `
+          /requireSsl:false 2>&1 | Out-Null
 
-      # Enable Windows Authentication (required for WebDAV write operations)
-      & $appcmd set config "Default Web Site" `
-        -section:system.webServer/security/authentication/windowsAuthentication `
-        /enabled:true 2>&1 | Out-Null
+        # Enable Windows Authentication (required for WebDAV write operations)
+        & $appcmd set config "Default Web Site" `
+          -section:system.webServer/security/authentication/windowsAuthentication `
+          /enabled:true 2>&1 | Out-Null
 
-      # Allow anonymous authentication for read access
-      & $appcmd set config "Default Web Site" `
-        -section:system.webServer/security/authentication/anonymousAuthentication `
-        /enabled:true 2>&1 | Out-Null
+        # Allow anonymous authentication for read access
+        & $appcmd set config "Default Web Site" `
+          -section:system.webServer/security/authentication/anonymousAuthentication `
+          /enabled:true 2>&1 | Out-Null
 
-      $Ansible.Changed = $true
-      Write-Output "WebDAV authoring enabled on Default Web Site"
+        $Ansible.Changed = $true
+        Write-Output "WebDAV authoring enabled on Default Web Site"
+      }
   when: ludus_iis_webdav_mode in ['server', 'both']
-  changed_when: false
 
 - name: Configure WebDAV authoring rules
   ansible.windows.win_powershell:
@@ -239,9 +244,15 @@
       $appcmd = "$env:SystemRoot\System32\inetsrv\appcmd.exe"
 
       # Allow all MIME types for WebDAV (needed for arbitrary file uploads)
-      & $appcmd set config "Default Web Site" `
-        -section:system.webServer/webdav/authoring `
-        "/fileSystem.allowHiddenFiles:true" 2>&1 | Out-Null
+      # Check current hidden files setting before applying
+      $currentConfig = & $appcmd list config "Default Web Site" `
+        -section:system.webServer/webdav/authoring 2>&1
+      if ($currentConfig -match 'allowHiddenFiles:"false"') {
+        & $appcmd set config "Default Web Site" `
+          -section:system.webServer/webdav/authoring `
+          "/fileSystem.allowHiddenFiles:true" 2>&1 | Out-Null
+        $Ansible.Changed = $true
+      }
 
       # Add a catch-all MIME type if not already present
       $existing = & $appcmd list config "Default Web Site" `
@@ -251,12 +262,11 @@
           -section:staticContent `
           "/+[fileExtension='.*',mimeType='application/octet-stream']" 2>&1 | Out-Null
         Write-Output "Added catch-all MIME type"
+        $Ansible.Changed = $true
       } else {
         Write-Output "Catch-all MIME type already exists"
       }
-      $Ansible.Changed = $true
   when: ludus_iis_webdav_mode in ['server', 'both']
-  changed_when: false
 
 # ============================================================
 # Ensure IIS service is running

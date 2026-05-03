@@ -20,7 +20,7 @@
     adapter_names: "*"
     ipv4_addresses:
       - "{{ ludus_parent_dc_ip }}"
-      - "{{ ansible_host }}"
+      - "127.0.0.1"
 
 # Step 3: Create the child domain (idempotent - skips if already DC)
 - name: Create child domain
@@ -28,7 +28,7 @@
     dns_domain_name: "{{ ludus_child_domain_fqdn }}"
     domain_admin_user: "{{ ludus_domain_admin_user | default(defaults.ad_domain_admin + '@' + ludus_parent_domain_fqdn) }}"
     domain_admin_password: "{{ ludus_domain_admin_password | default(defaults.ad_domain_admin_password) }}"
-    safe_mode_password: "{{ ludus_safe_mode_password | default(defaults.ad_domain_safe_mode_password) }}"
+    safe_mode_password: "{{ ludus_safe_mode_password | default(defaults.ad_domain_admin_password | default('password')) }}"
     create_dns_delegation: "{{ ludus_create_dns_delegation | default(true) }}"
     install_dns: true
     reboot: true
@@ -58,10 +58,12 @@
 
 # Step 6: Verify DNS is resolving the child domain before returning
 - name: Wait for DNS to resolve child domain
-  ansible.windows.win_shell: |
-    Resolve-DnsName "{{ ludus_child_domain_fqdn }}" -ErrorAction Stop
+  ansible.windows.win_powershell:
+    script: |
+      Resolve-DnsName "{{ ludus_child_domain_fqdn }}" -ErrorAction Stop
+      $Ansible.Changed = $false
   register: _dns_result
-  until: _dns_result.rc == 0
+  until: _dns_result is succeeded
   retries: 20
   delay: 30
   when: _child_domain_result.changed

@@ -167,6 +167,7 @@
         Write-Output "No trust status available via WMI"
       }
       $Ansible.Changed = $false
+  changed_when: false
 
 # ============================================================
 # Cross-Domain Group Members (runs AFTER trust is established)
@@ -186,9 +187,50 @@
       $changed = $false
       foreach ($member in $Members) {
         try {
-          Add-ADGroupMember -Identity $GroupName -Members $member -ErrorAction Stop
-          Write-Output "Added $member to $GroupName"
-          $changed = $true
+          # Parse DOMAIN\user or domain/user format to extract domain and username
+          $memberObj = $null
+          if ($member -match '^(.+?)\\(.+)$') {
+            $memberDomain = $Matches[1]
+            $memberName   = $Matches[2]
+            # Resolve the domain FQDN from the NetBIOS name if needed
+            try {
+              $domainFqdn = (Get-ADDomain -Identity $memberDomain -ErrorAction SilentlyContinue).DNSRoot
+            } catch { $domainFqdn = $null }
+            # Try to find the DC for this domain via DNS
+            $dcForDomain = $memberDomain
+            if ($domainFqdn) { $dcForDomain = $domainFqdn }
+
+            # Fetch the object from its own domain DC
+            try {
+              $memberObj = Get-ADObject -Filter "SamAccountName -eq '$memberName'" -Server $dcForDomain -ErrorAction Stop | Select-Object -First 1
+            } catch {
+              # Fallback: try as user, then group
+              try { $memberObj = Get-ADUser -Identity $memberName -Server $dcForDomain -ErrorAction Stop } catch {}
+              if (-not $memberObj) {
+                try { $memberObj = Get-ADGroup -Identity $memberName -Server $dcForDomain -ErrorAction Stop } catch {}
+              }
+            }
+          }
+
+          # Check if already a member (using the group's Member property to avoid GC lookup errors)
+          $grp = Get-ADGroup $GroupName -Properties Members -ErrorAction SilentlyContinue
+          $alreadyMember = $false
+          if ($grp -and $memberObj) {
+            $alreadyMember = $grp.Members -contains $memberObj.DistinguishedName
+          }
+
+          if (-not $alreadyMember) {
+            if ($memberObj) {
+              Add-ADGroupMember -Identity $GroupName -Members $memberObj -ErrorAction Stop
+            } else {
+              # Fallback to string-based add
+              Add-ADGroupMember -Identity $GroupName -Members $member -ErrorAction Stop
+            }
+            Write-Output "Added $member to $GroupName"
+            $changed = $true
+          } else {
+            Write-Output "$member is already a member of $GroupName"
+          }
         } catch [Microsoft.ActiveDirectory.Management.ADException] {
           if ($_.Exception.Message -match "already a member") {
             Write-Output "$member is already a member of $GroupName"

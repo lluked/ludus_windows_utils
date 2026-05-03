@@ -1,30 +1,23 @@
 ---
 # ludus_child_domain_join — Join a machine to a child domain (idempotent)
-# Reference: https://docs.ansible.com/ansible/latest/collections/microsoft/ad/membership_module.html
+# Based on: https://github.com/ChoiSG/ludus_ansible_roles/tree/main/ludus_child_domain_join
 #
-# microsoft.ad.membership is idempotent - it checks membership state and skips if joined
+# Uses microsoft.ad.membership with domain_server set to the DC's FQDN hostname
+# (not IP) to force Kerberos authentication. NetJoinDomain on Windows Server 2022
+# fails with NTLM to an IP address due to loopback/NTLM restrictions on DCs
+# ("Access is denied" / "network name not available"). Using the hostname triggers
+# Kerberos which has no such restriction.
 #
-# IMPORTANT: Uses CHILD domain admin credentials, NOT parent/Enterprise Admin.
-# A workgroup machine (not yet domain-joined) can only use NTLM authentication.
-# If we used parent domain creds (domainadmin@sevenkingdoms.local), the child DC
-# would need to forward NTLM auth to the parent DC via the trust channel. This
-# forwarding breaks when ludus_ad_anonymous_rpc LSA settings are applied on the
-# child DC (RestrictAnonymous=0, EveryoneIncludesAnonymous=1), causing
-# "The specified network name is no longer available" during NetJoinDomain.
-#
-# By using child domain creds (domainadmin@north.sevenkingdoms.local), the auth
-# is handled entirely locally on the child DC — no cross-domain NTLM forwarding.
-# Ludus uses the same admin credentials across all domains by default, so the
-# child domain admin has the same username/password as the parent.
+# Required role_vars:
+#   ludus_child_domain_fqdn   - e.g. north.sevenkingdoms.local
+#   ludus_child_dc_ip         - e.g. 10.X.10.11 (for DNS + port waits)
+#   ludus_child_dc_hostname   - e.g. winterfell.north.sevenkingdoms.local (for domain_server)
 
-# Step 1: Configure DNS to the child domain DC
 - name: Configure DNS to child domain DC
   ansible.windows.win_dns_client:
     adapter_names: "*"
     ipv4_addresses:
       - "{{ ludus_child_dc_ip }}"
-
-# Step 2: Pre-flight — verify child DC network services are reachable (TCP ports)
 
 - name: Wait for LDAP port on child DC
   ansible.windows.win_wait_for:
@@ -44,13 +37,37 @@
     port: 445
     timeout: 300
 
-# Step 3: Join the machine to the child domain (idempotent - skips if already joined)
-# Uses CHILD domain admin credentials to avoid cross-domain NTLM forwarding issues
+- name: Wait for child DC AD stack to be ready
+  ansible.windows.win_powershell:
+    script: |
+      $dc = "{{ ludus_child_dc_ip }}"
+      try {
+          $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$dc/RootDSE")
+          $domain = $de.Properties["defaultNamingContext"].Value
+          if ($domain) {
+              Write-Output "AD stack ready: $domain"
+              $Ansible.Changed = $false
+          } else {
+              throw "rootDSE returned empty"
+          }
+      } catch {
+          throw "DC not ready: $_"
+      }
+  register: _dc_check
+  until: _dc_check is succeeded
+  retries: 40
+  delay: 15
+  changed_when: false
+
+# Use domain_server with the DC's FQDN (hostname) to force Kerberos.
+# NetJoinDomain on Windows Server 2022 fails with NTLM-to-IP due to DC loopback
+# protection. Kerberos (triggered by hostname) has no such restriction.
 - name: Join machine to child domain
   microsoft.ad.membership:
     dns_domain_name: "{{ ludus_child_domain_fqdn }}"
-    domain_admin_user: "{{ ludus_domain_admin_user | default(defaults.ad_domain_admin + '@' + ludus_child_domain_fqdn) }}"
-    domain_admin_password: "{{ ludus_domain_admin_password | default(defaults.ad_domain_admin_password) }}"
+    domain_admin_user: "{{ ludus_domain_admin_user | default('administrator@' + ludus_child_domain_fqdn) }}"
+    domain_admin_password: "{{ ludus_domain_admin_password | default(defaults.ad_domain_admin_password | default('password')) }}"
+    domain_server: "{{ ludus_child_dc_hostname | default(omit) }}"
     state: domain
     reboot: true
   register: _domain_join_result

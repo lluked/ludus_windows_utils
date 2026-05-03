@@ -127,10 +127,7 @@ ludus_goad_acl_data:
     - principal: "missandei"
       target: "viserys.targaryen"
       right: "GenericWrite"
-    # gMSA ACL (added after gMSA creation)
+     # gMSA ACL (added after gMSA creation)
     # - principal: "gmsaDragon$"
     #   target: "drogon"
     #   right: "GenericAll"
-
-# Use GOAD data for the current domain
-ludus_use_goad_acls: true

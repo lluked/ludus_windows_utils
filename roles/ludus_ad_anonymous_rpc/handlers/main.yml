@@ -1,0 +1,7 @@
+---
+- name: Restart LanmanServer
+  ansible.windows.win_powershell:
+    script: |
+      Restart-Service -Name LanmanServer -Force
+      $Ansible.Changed = $true
+  listen: restart lanmanserver
