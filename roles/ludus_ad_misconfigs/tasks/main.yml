@@ -39,6 +39,16 @@
         ludus_lsa_ppl_enabled: "{{ _goad_config.lsa_ppl_enabled | default(false) }}"
       when: _goad_config.lsa_ppl_enabled is defined
 
+    - name: Apply GOAD ADCS ESC10 KDC setting
+      ansible.builtin.set_fact:
+        ludus_adcs_esc10_kdc: "{{ _goad_config.adcs_esc10_kdc | default(false) }}"
+      when: _goad_config.adcs_esc10_kdc is defined
+
+    - name: Apply GOAD Windows Defender setting
+      ansible.builtin.set_fact:
+        ludus_windows_defender_disabled: "{{ _goad_config.windows_defender_disabled | default(false) }}"
+      when: _goad_config.windows_defender_disabled is defined
+
     - name: Apply GOAD autologon settings
       ansible.builtin.set_fact:
         ludus_autologon_enabled: "{{ _goad_config.autologon.enabled | default(false) }}"
@@ -135,6 +145,33 @@
 # ============================================================================
 # FIREWALL CONFIGURATION
 # ============================================================================
+
+# NOTE: For primary-dc VMs, prefer Ludus's built-in windows.gpos: [disable_defender]
+# in range.yml — it creates a GPO that fully disables Defender across the whole domain
+# (survives reboots, disables the service entirely, covers all domain members).
+# This task is a fallback for member servers or child DCs that cannot use the built-in
+# GPO (e.g., castelblack in north.sevenkingdoms.local whose DC is a non-Ludus child DC).
+- name: Disable Windows Defender real-time protection
+  when: ludus_windows_defender_disabled | default(false) | bool
+  block:
+    - name: Disable Windows Defender real-time monitoring
+      ansible.windows.win_powershell:
+        script: |
+          try {
+            Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
+            Write-Output "Windows Defender real-time monitoring disabled"
+            $Ansible.Changed = $true
+          } catch {
+            # Defender may already be disabled or unavailable (e.g., Server Core)
+            Write-Output "Defender disable skipped: $($_.Exception.Message)"
+            $Ansible.Changed = $false
+          }
+      changed_when: "'disabled' in _defender_result.output | default([])"
+      register: _defender_result
+
+    - name: Log Defender disabled
+      ansible.builtin.debug:
+        msg: "Windows Defender real-time protection disabled"
 
 - name: Disable Windows Firewall
   when: ludus_firewall_disabled | bool
@@ -698,14 +735,33 @@
               
               # Link GPO to target if specified
               if ($LinkTarget) {
-                  try {
-                      $link = Get-GPLink -Name $GpoName -Target $LinkTarget -ErrorAction SilentlyContinue
-                      if (-not $link) {
-                          New-GPLink -Name $GpoName -Target $LinkTarget -LinkEnabled Yes
-                          Write-Output "Linked GPO to: $LinkTarget"
+                  # Check all existing links for this GPO
+                  $gpoObj = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
+                  $alreadyLinked = $false
+                  if ($gpoObj) {
+                      $report = Get-GPOReport -Name $GpoName -ReportType XML -ErrorAction SilentlyContinue
+                      if ($report -and $report -match [regex]::Escape($LinkTarget)) {
+                          $alreadyLinked = $true
                       }
-                  } catch {
-                      Write-Output "GPO link skipped or already exists"
+                  }
+                  if (-not $alreadyLinked) {
+                      # Remove links to any other targets first
+                      try {
+                          $allLinks = (Get-GPInheritance -Target $LinkTarget -ErrorAction SilentlyContinue).GpoLinks
+                          # Use Get-GPO report to find all link targets for this GPO
+                      } catch {}
+                      try {
+                          New-GPLink -Name $GpoName -Target $LinkTarget -LinkEnabled Yes -ErrorAction Stop
+                          Write-Output "Linked GPO to: $LinkTarget"
+                      } catch {
+                          if ($_ -match "already") {
+                              Write-Output "GPO already linked to: $LinkTarget"
+                          } else {
+                              Write-Output "GPO link warning: $_"
+                          }
+                      }
+                  } else {
+                      Write-Output "GPO already linked to correct target: $LinkTarget"
                   }
               }
               
@@ -896,6 +952,37 @@
     - name: Log WebClient enabled
       ansible.builtin.debug:
         msg: "WebClient service enabled - host is vulnerable to WebDAV coercion"
+
+# ============================================================================
+# ADCS ESC10 — KDC Registry Changes (DC-side, not CA-side)
+# ============================================================================
+
+- name: Apply ADCS ESC10 KDC registry changes
+  when: ludus_adcs_esc10_kdc | default(false) | bool
+  block:
+    # ESC10 Case 1: Disable StrongCertificateBindingEnforcement
+    # Allows certificate-based logon without strict SAN-to-UPN binding
+    - name: Disable StrongCertificateBindingEnforcement (ESC10 Case 1)
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Kdc
+        name: StrongCertificateBindingEnforcement
+        data: 0
+        type: dword
+        state: present
+
+    # ESC10 Case 2: Enable UPN certificate mapping via Schannel
+    # CertificateMappingMethods = 0x4 enables UPN mapping
+    - name: Enable UPN certificate mapping via Schannel (ESC10 Case 2)
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\Schannel
+        name: CertificateMappingMethods
+        data: 4
+        type: dword
+        state: present
+
+    - name: Log ESC10 KDC settings applied
+      ansible.builtin.debug:
+        msg: "ADCS ESC10 KDC registry changes applied (StrongCertificateBindingEnforcement=0, CertificateMappingMethods=0x4)"
 
 # ============================================================================
 # LDAP SIGNING CONFIGURATION

@@ -77,16 +77,41 @@ ludus_goad_smb_shares:
       no_access: []
       allow_anonymous: true
 
+    - name: "thewall"
+      path: "C:\\thewall"
+      description: "Share for jon.snow/samwell.tarly lateral movement"
+      full_access:
+        - "NORTH\\Stark"
+      read_access:
+        - "Users"
+      change_access:
+        - "NORTH\\jon.snow"
+        - "NORTH\\samwell.tarly"
+      no_access: []
+      allow_anonymous: false
+
   braavos:
     - name: "all"
       path: "C:\\shares\\all"
       description: "Writable share"
       full_access:
         - "Domain Users"
+        - "Everyone"
       read_access: []
       change_access: []
       no_access: []
       allow_anonymous: false
+
+    - name: "public"
+      path: "C:\\shares\\public"
+      description: "Public readable share"
+      full_access: []
+      read_access:
+        - "Everyone"
+      change_access:
+        - "Users"
+      no_access: []
+      allow_anonymous: true
 
     - name: "CertEnroll"
       path: "C:\\Windows\\system32\\CertSrv\\CertEnroll"

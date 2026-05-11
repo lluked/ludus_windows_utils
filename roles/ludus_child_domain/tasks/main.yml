@@ -22,6 +22,26 @@
       - "{{ ludus_parent_dc_ip }}"
       - "127.0.0.1"
 
+# Step 2b: Wait for parent DC to be reachable via DNS before promoting
+# DCPromo exit 54 occurs when the parent DC's DNS/RPC is not yet ready.
+- name: Wait for parent DC to be DNS-reachable before promoting
+  ansible.windows.win_powershell:
+    script: |
+      $timeout = 180
+      $timer = [System.Diagnostics.Stopwatch]::StartNew()
+      while ($timer.Elapsed.TotalSeconds -lt $timeout) {
+        try {
+          $result = Resolve-DnsName "{{ ludus_parent_domain_fqdn }}" -Server "{{ ludus_parent_dc_ip }}" -ErrorAction Stop
+          Write-Output "Parent domain DNS resolved"
+          $Ansible.Changed = $false
+          return
+        } catch {
+          Start-Sleep -Seconds 10
+        }
+      }
+      throw "Parent domain '{{ ludus_parent_domain_fqdn }}' not DNS-resolvable after ${timeout}s"
+  changed_when: false
+
 # Step 3: Create the child domain (idempotent - skips if already DC)
 - name: Create child domain
   microsoft.ad.domain_child:

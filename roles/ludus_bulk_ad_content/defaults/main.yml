@@ -108,17 +108,17 @@ ludus_goad_data:
           path: "OU=Crownlands,DC=sevenkingdoms,DC=local"
         - name: KingsGuard
           path: "OU=Crownlands,DC=sevenkingdoms,DC=local"
-      domainlocal:
-        - name: AcrossTheNarrowSea
-          path: "CN=Users,DC=sevenkingdoms,DC=local"
-      universal:
         - name: DragonRider
           path: "OU=Crownlands,DC=sevenkingdoms,DC=local"
+      domainlocal:
+        - name: AcrossTheNarrowSea
+          path: "DC=sevenkingdoms,DC=local"
+          scope: domainlocal
 
-    multi_domain_group_members:
-      - group: "AcrossTheNarrowSea"
-        members:
-          - "essos.local\\daenerys.targaryen"
+    # NOTE: Cross-domain group members (daenerys.targaryen in AcrossTheNarrowSea)
+    # are handled by ludus_ad_forest_trust role AFTER the forest trust is established.
+    # The multi_domain_group_members key below is retained for documentation only
+    # but is NOT processed by ludus_bulk_ad_content — forest trust is required first.
 
     users:
       - name: tywin.lannister
@@ -455,14 +455,9 @@ ludus_goad_data:
         - name: greatmaster
           path: "CN=Users,DC=essos,DC=local"
 
-    multi_domain_group_members:
-      - group: "DragonsFriends"
-        members:
-          - "sevenkingdoms.local\\tyron.lannister"
-          - "essos.local\\daenerys.targaryen"
-      - group: "Spys"
-        members:
-          - "sevenkingdoms.local\\Small Council"
+    # NOTE: Cross-domain group members (DragonsFriends, Spys) are handled by
+    # ludus_ad_forest_trust role AFTER the forest trust is established.
+    # Processing them here would always fail silently (no trust yet).
 
     users:
       - name: daenerys.targaryen

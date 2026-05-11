@@ -41,163 +41,220 @@
         ACL entries to apply: {{ _acl_entries | length }}
 
 # =============================================================================
-# APPLY ACL ENTRIES
-# Each entry is applied idempotently - checks if ACE exists first
+# APPLY ACL ENTRIES — single PowerShell session for all entries
 # =============================================================================
+# All ACEs are applied in ONE PowerShell call to avoid a Win2022 issue where
+# separate per-ACE WinRM sessions cause Set-Acl to not persist writes reliably.
+# Each individual PS session on Win2022 appears to flush writes differently;
+# a single session processes all ACEs atomically against the AD LDAP connection.
+# This matches the upstream GOAD approach: one script per role run, all ACEs.
 - name: Apply AD ACL entries
   ansible.windows.win_powershell:
     script: |
-      [CmdletBinding()]
-      param (
-        [String]$Principal,
-        [String]$Target,
-        [String]$TargetType,
-        [String]$Right,
-        [Bool]$WellKnown,
-        [String]$DomainDN
-      )
-      
       Import-Module ActiveDirectory
-      
-      # Map right names to ActiveDirectoryRights enum values
-      $rightMapping = @{
-        'GenericAll' = 'GenericAll'
-        'GenericWrite' = 'GenericWrite'
-        'GenericRead' = 'GenericRead'
-        'GenericExecute' = 'GenericExecute'
-        'WriteDacl' = 'WriteDacl'
-        'WriteOwner' = 'WriteOwner'
-        'WriteProperty' = 'WriteProperty'
-        'ReadProperty' = 'ReadProperty'
-        'Delete' = 'Delete'
-        'DeleteTree' = 'DeleteTree'
-        'ExtendedRight' = 'ExtendedRight'
-        'CreateChild' = 'CreateChild'
-        'DeleteChild' = 'DeleteChild'
-        'Self' = 'Self'
-        'ForceChangePassword' = 'ExtendedRight'  # Special handling
-        'Self-Membership' = 'Self'  # Special handling
-      }
-      
-      # Extended rights GUIDs
+      Set-Location AD:
+
+      $DomainDN = "{{ _ludus_domain_name.split('.') | map('regex_replace', '^', 'DC=') | join(',') }}"
+
       $extendedRights = @{
-        'ForceChangePassword' = '00299570-246d-11d0-a768-00aa006e0529'  # User-Force-Change-Password
-        'Self-Membership' = 'bf9679c0-0de6-11d0-a285-00aa003049e2'  # Self-Membership
+        'ForceChangePassword' = @{ right = 'ExtendedRight'; guid = '00299570-246d-11d0-a768-00aa006e0529' }
+        'Self-Membership'     = @{ right = 'Self';          guid = 'bf9679c0-0de6-11d0-a285-00aa003049e2' }
       }
-      
-      # Get principal SID
-      try {
-        if ($WellKnown) {
-          # Well-known principals like ANONYMOUS LOGON
-          $principalSID = New-Object System.Security.Principal.NTAccount("NT AUTHORITY", $Principal)
+
+      $aclEntries = @(
+        {% for item in _acl_entries %}
+        @{
+          principal           = '{{ item.principal | replace("'", "''") }}'
+          target              = '{{ item.target | replace("'", "''") }}'
+          right               = '{{ item.right }}'
+          inheritance         = '{{ item.inheritance | default("None") }}'
+          wellKnown           = ${{ item.well_known | default(false) | string | lower }}
+          skipMissingPrincipal= ${{ item.skip_missing_principal | default(false) | string | lower }}
+          skipMissingTarget   = ${{ item.skip_missing_target | default(false) | string | lower }}
+        }
+        {% endfor %}
+      )
+
+      $changed = $false
+
+      foreach ($entry in $aclEntries) {
+        $principal  = $entry.principal
+        $target     = $entry.target
+        $right      = $entry.right
+        $wellKnown  = $entry.wellKnown
+        $inh        = $entry.inheritance
+        $skipP      = $entry.skipMissingPrincipal
+        $skipT      = $entry.skipMissingTarget
+
+        # ── Resolve principal SID ──────────────────────────────────────────
+        $principalSID = $null
+        if ($wellKnown) {
+          $principalSID = New-Object System.Security.Principal.NTAccount($principal)
         } else {
-          $principalObj = Get-ADObject -Filter "sAMAccountName -eq '$Principal' -or Name -eq '$Principal'" -Properties objectSid
-          if (-not $principalObj) {
-            throw "Principal '$Principal' not found in AD"
+          $pObj = Get-ADObject -Filter "SamAccountName -eq '$principal'" -Properties objectSid -ErrorAction SilentlyContinue
+          if (-not $pObj) {
+            if ($skipP) { Write-Output "SKIPPED (principal not found): $principal -> $target"; continue }
+            Write-Output "ERROR: principal '$principal' not found"; continue
           }
-          $principalSID = New-Object System.Security.Principal.SecurityIdentifier($principalObj.objectSid)
+          $principalSID = New-Object System.Security.Principal.SecurityIdentifier($pObj.objectSid)
         }
-      } catch {
-        throw "Failed to resolve principal '$Principal': $_"
-      }
-      
-      # Get target object
-      try {
-        switch ($TargetType) {
-          'computer' {
-            $targetName = $Target -replace '\$$', ''
-            $targetObj = Get-ADComputer -Identity $targetName
-          }
-          'group' {
-            $targetObj = Get-ADGroup -Filter "sAMAccountName -eq '$Target' -or Name -eq '$Target'"
-          }
-          'ou' {
-            $ouName = $Target -replace '^OU=', ''
-            $targetObj = Get-ADOrganizationalUnit -Filter "Name -eq '$ouName'"
-          }
-          'container' {
-            $targetObj = Get-ADObject -Filter "distinguishedName -eq '$Target,$DomainDN'"
-            if (-not $targetObj) {
-              $targetObj = Get-ADObject -Identity "$Target,$DomainDN"
-            }
-          }
-          default {
-            # Assume user
-            $targetObj = Get-ADUser -Filter "sAMAccountName -eq '$Target' -or Name -eq '$Target'"
+
+        # ── Resolve target DN ──────────────────────────────────────────────
+        $targetDN = $null
+        # Try direct path first (handles full DNs like AdminSDHolder, cert templates)
+        try {
+          $testAcl = Get-Acl -Path $target -ErrorAction Stop
+          $targetDN = $target
+        } catch [System.Management.Automation.ItemNotFoundException] {
+          # Fall through to SamAccountName lookup
+        } catch {
+          # Not an ItemNotFound error — could be access denied or other
+        }
+
+        if (-not $targetDN) {
+          # Check if target is a partial DN (like "CN=AdminSDHolder,CN=System")
+          # If so, append the domain DN to make it resolvable
+          if ($target -match '^CN=' -and $target -notmatch 'DC=') {
+            $fullDN = "$target,$DomainDN"
+            $tObjByDN = Get-ADObject -Identity $fullDN -ErrorAction SilentlyContinue
+            if ($tObjByDN) { $targetDN = $tObjByDN.DistinguishedName }
           }
         }
-        
-        if (-not $targetObj) {
-          throw "Target '$Target' (type: $TargetType) not found in AD"
+
+        if (-not $targetDN) {
+          $tFilter = "SamAccountName -eq '$target'"
+          $tObj = Get-ADObject -Filter $tFilter -ErrorAction SilentlyContinue
+          if (-not $tObj) {
+            # Try by Name for groups
+            $tObj = Get-ADObject -Filter "Name -eq '$target'" -ErrorAction SilentlyContinue
+          }
+          if (-not $tObj) {
+            # Try as OU by name
+            $ouName = $target -replace '^OU=',''
+            $tObj = Get-ADOrganizationalUnit -Filter "Name -eq '$ouName'" -ErrorAction SilentlyContinue
+          }
+          if ($tObj) { $targetDN = $tObj.DistinguishedName }
         }
-      } catch {
-        throw "Failed to resolve target '$Target': $_"
+
+        if (-not $targetDN) {
+          if ($skipT) { Write-Output "SKIPPED (target not found): $principal -> $target"; continue }
+          Write-Output "ERROR: target '$target' not found"; continue
+        }
+
+        # ── Build ACE ─────────────────────────────────────────────────────
+        $type    = [System.Security.AccessControl.AccessControlType]::Allow
+        $inhType = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::$inh
+        $ace     = $null
+
+        if ($extendedRights.ContainsKey($right)) {
+          $er       = $extendedRights[$right]
+          $adRight  = [System.DirectoryServices.ActiveDirectoryRights]::($er.right)
+          $ace      = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($principalSID, $adRight, $type, [Guid]$er.guid, $inhType)
+        } else {
+          $adRight  = [System.DirectoryServices.ActiveDirectoryRights]::$right
+          $ace      = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($principalSID, $adRight, $type, $inhType)
+        }
+
+        # ── Check idempotency and apply ────────────────────────────────────
+        $acl = Get-Acl -Path $targetDN
+        $existingAces = $acl.Access | Where-Object {
+          try {
+            $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $principalSID.Value -and
+            $_.ActiveDirectoryRights -eq $ace.ActiveDirectoryRights -and
+            $_.AccessControlType -eq $ace.AccessControlType
+          } catch { $false }
+        }
+
+        if ($existingAces) {
+          Write-Output "OK: $principal -> $target ($right)"
+        } else {
+          $acl.AddAccessRule($ace)
+          Set-Acl -AclObject $acl -Path $targetDN
+          Write-Output "ACE added: $principal -> $target ($right)"
+          $changed = $true
+        }
       }
-      
-      $targetDN = $targetObj.DistinguishedName
-      $adPath = "AD:\$targetDN"
-      
-      # Get current ACL
-      $acl = Get-Acl -Path $adPath
-      
-      # Determine the right to apply
-      $adRight = $rightMapping[$Right]
-      if (-not $adRight) {
-        throw "Unknown right: $Right"
-      }
-      
-      # Build the ACE
-      $inheritance = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
-      $accessType = [System.Security.AccessControl.AccessControlType]::Allow
-      
-      if ($Right -eq 'ForceChangePassword' -or $Right -eq 'Self-Membership') {
-        # Extended right with specific GUID
-        $rightGuid = [Guid]$extendedRights[$Right]
-        $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-          $principalSID,
-          [System.DirectoryServices.ActiveDirectoryRights]::$adRight,
-          $accessType,
-          $rightGuid,
-          $inheritance
-        )
-      } else {
-        $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-          $principalSID,
-          [System.DirectoryServices.ActiveDirectoryRights]::$adRight,
-          $accessType,
-          $inheritance
-        )
-      }
-      
-      # Check if ACE already exists
-      $existingAces = $acl.Access | Where-Object {
-        $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $principalSID.Value -and
-        $_.ActiveDirectoryRights -eq $ace.ActiveDirectoryRights -and
-        $_.AccessControlType -eq $ace.AccessControlType
-      }
-      
-      if ($existingAces) {
-        Write-Output "ACE already exists: $Principal -> $Target ($Right)"
-        $Ansible.Changed = $false
-      } else {
-        # Add the ACE
-        $acl.AddAccessRule($ace)
-        Set-Acl -Path $adPath -AclObject $acl
-        Write-Output "ACE added: $Principal -> $Target ($Right)"
-        $Ansible.Changed = $true
-      }
-    parameters:
-      Principal: "{{ item.principal }}"
-      Target: "{{ item.target }}"
-      TargetType: "{{ item.target_type | default('user') }}"
-      Right: "{{ item.right }}"
-      WellKnown: "{{ item.well_known | default(false) }}"
-      DomainDN: "{{ _ludus_domain_name.split('.') | map('regex_replace', '^', 'DC=') | join(',') }}"
-  loop: "{{ _acl_entries }}"
-  loop_control:
-    label: "{{ item.principal }} → {{ item.target }} ({{ item.right }})"
+
+      $Ansible.Changed = $changed
   when: _acl_entries | length > 0
   register: _acl_results
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: "{{ ludus_ad_acl_become_user }}"
+    ansible_become_password: "{{ ludus_ad_acl_become_password }}"
+    # NOTE: No logon_type=interactive here — that flag causes Set-Acl to silently
+    # fail to persist ACEs to AD. Default runas logon type (new_credentials) works.
+
+# ============================================================================
+# SDPROP NOTE — protected objects (adminCount=1)
+# ============================================================================
+# SDPROP runs every 60 minutes and resets ACLs on adminCount=1 objects.
+# The ACE on AdminSDHolder ensures SDPROP propagates the right ACEs to
+# Domain Admins (sevenkingdoms) and drogon (essos, via nesting chain).
+#
+# We do NOT trigger immediate SDPROP here because forcibly triggering it
+# causes Windows to also re-evaluate and reset ACLs on non-protected objects
+# in the domain NC (via defaultSecurityDescriptor inheritance), wiping custom
+# ACEs written in this same role run.
+#
+# The trade-off: ACEs on SDPROP-protected objects (Domain Admins, drogon)
+# take up to 60 minutes to propagate from AdminSDHolder. All other ACEs
+# (non-adminCount=1 objects) are stable immediately after this role completes.
+
+- name: Force AD replication after ACL changes
+  ansible.windows.win_powershell:
+    script: |
+      # Force immediate replication so ACEs don't get overwritten by stale replicas.
+      # In multi-DC environments (sevenkingdoms has north child DC, essos is separate
+      # forest) a replication conflict can wipe custom ACEs if another DC touches
+      # the object before the ACE replicates. repadmin /syncall forces all partitions
+      # to replicate immediately.
+      try {
+        $out = repadmin /syncall /AdeP 2>&1
+        Write-Output "AD replication triggered"
+      } catch {
+        Write-Output "repadmin skipped: $_"
+      }
+      $Ansible.Changed = $false
+  when: _acl_results.changed | default(false)
+  changed_when: false
+
+# =============================================================================
+# GOAD POST-JOIN DELEGATION — CASTELBLACK$ kerb-only constrained delegation
+# =============================================================================
+# In the GOAD range config, DC02 (winterfell) runs ludus_ad_misconfigs BEFORE
+# SRV02 (castelblack) joins the domain. The domain join recreates the CASTELBLACK$
+# computer object, wiping the msDS-AllowedToDelegateTo setting.
+#
+# This task runs AFTER the depends_on on SRV02's ludus_child_domain_join, so the
+# computer object is stable and we can safely set the delegation here on DC02.
+- name: Set CASTELBLACK$ kerb-only constrained delegation (GOAD — runs after domain join)
+  ansible.windows.win_powershell:
+    script: |
+      Import-Module ActiveDirectory
+      $delegateTo = @('HTTP/winterfell.north.sevenkingdoms.local', 'HTTP/winterfell')
+      $comp = Get-ADComputer -Identity castelblack -Server 'north.sevenkingdoms.local' `
+                -Properties 'msDS-AllowedToDelegateTo' -ErrorAction SilentlyContinue
+      if (-not $comp) {
+        Write-Output "SKIP: castelblack computer object not found in north.sevenkingdoms.local"
+        $Ansible.Changed = $false
+        return
+      }
+      $current = $comp.'msDS-AllowedToDelegateTo'
+      $needed  = $delegateTo | Where-Object { $current -notcontains $_ }
+      if ($needed.Count -eq 0) {
+        Write-Output "OK: CASTELBLACK$ AllowedToDelegateTo already configured"
+        $Ansible.Changed = $false
+      } else {
+        Set-ADComputer -Identity castelblack -Server 'north.sevenkingdoms.local' `
+          -Replace @{'msDS-AllowedToDelegateTo' = $delegateTo}
+        Write-Output "Set CASTELBLACK$ AllowedToDelegateTo: $($delegateTo -join ', ')"
+        $Ansible.Changed = $true
+      }
+  when: >
+    ludus_ad_acl_mode == "goad" and
+    _ludus_domain_name == "north.sevenkingdoms.local"
 
 # =============================================================================
 # SUMMARY

@@ -139,3 +139,39 @@
 - name: Display gMSA account status
   ansible.builtin.debug:
     msg: "{{ gmsa_verification.output | default(['No gMSA accounts found']) }}"
+
+# ============================================================
+# gMSA Host Installation — Install-ADServiceAccount on member hosts
+# Only runs if ludus_gmsa_install_on_host is true
+# ============================================================
+
+- name: Install gMSA on permitted member hosts
+  ansible.windows.win_powershell:
+    script: |
+      param([String]$gMSA_Name)
+      Import-Module ActiveDirectory
+      try {
+        Install-ADServiceAccount -Identity $gMSA_Name -ErrorAction Stop
+        Write-Output "Installed gMSA '$gMSA_Name' on this host"
+        $Ansible.Changed = $true
+      } catch {
+        if ($_ -match "already installed") {
+          Write-Output "gMSA '$gMSA_Name' already installed"
+          $Ansible.Changed = $false
+        } else {
+          Write-Error "Failed to install gMSA '$gMSA_Name': $_"
+        }
+      }
+    parameters:
+      gMSA_Name: "{{ item.name }}"
+  loop: "{{ ludus_gmsa_accounts }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - ludus_gmsa_install_on_host | default(false) | bool
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: "{{ ludus_domain_fqdn }}\\{{ ludus_gmsa_domain_admin }}"
+    ansible_become_password: "{{ ludus_gmsa_domain_admin_password }}"
+    ansible_become_flags: "logon_type=interactive logon_flags=with_profile"

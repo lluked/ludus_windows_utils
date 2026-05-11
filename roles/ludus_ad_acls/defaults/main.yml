@@ -18,6 +18,25 @@ ludus_ad_acl_domain: ""
 ludus_ad_acl_hostname_override: ""
 
 # =============================================================================
+# BECOME CREDENTIALS — for privileged ACL operations
+# =============================================================================
+# Some AD objects require privileged credentials to write ACLs:
+#   - Protected groups (Domain Admins, Enterprise Admins) — requires Domain Admin rights
+#   - AdminSDHolder object — requires Domain Admin rights
+#   - Configuration NC objects (cert templates) — requires Enterprise Admin rights
+#
+# The WinRM user (localuser) is NOT a domain admin and cannot write ACLs on
+# protected objects. Set these variables in role_vars to use a domain admin account.
+#
+# For GOAD ranges:
+#   sevenkingdoms.local: ludus_ad_acl_become_user: "SEVENKINGDOMS\\domainadmin"
+#   essos.local:        ludus_ad_acl_become_user: "ESSOS\\daenerys.targaryen"
+#   north domain:       ludus_ad_acl_become_user: "NORTH\\eddard.stark"
+#
+ludus_ad_acl_become_user: "{{ defaults.ad_domain_admin | default('Administrator') }}"
+ludus_ad_acl_become_password: "{{ defaults.ad_domain_admin_password | default('password') }}"
+
+# =============================================================================
 # CUSTOM ACL ENTRIES
 # =============================================================================
 # Custom ACL entries to apply - list of dicts with:
@@ -94,16 +113,22 @@ ludus_goad_acl_data:
       right: "WriteDacl"
 
   north.sevenkingdoms.local:
-    # Anonymous LOGON ACEs for RPC enumeration
+    # Anonymous LOGON ACEs on the domain root NC for anonymous RPC/LDAP enumeration.
+    # Target is the domain root object (DC=north,DC=sevenkingdoms,DC=local) — this
+    # allows ANONYMOUS LOGON to enumerate domain objects via null LDAP sessions,
+    # which is what enables rpcclient/enum4linux anonymous enumeration on winterfell.
+    # These ACEs must be on the domain root, not on the DC computer object.
     - principal: "ANONYMOUS LOGON"
-      target: "winterfell$"
-      target_type: "computer"
+      target: "DC=north,DC=sevenkingdoms,DC=local"
+      target_type: "domain"
       right: "ReadProperty"
+      inheritance: "All"
       well_known: true
     - principal: "ANONYMOUS LOGON"
-      target: "winterfell$"
-      target_type: "computer"
+      target: "DC=north,DC=sevenkingdoms,DC=local"
+      target_type: "domain"
       right: "GenericExecute"
+      inheritance: "All"
       well_known: true
 
   essos.local:
@@ -127,7 +152,25 @@ ludus_goad_acl_data:
     - principal: "missandei"
       target: "viserys.targaryen"
       right: "GenericWrite"
-     # gMSA ACL (added after gMSA creation)
-    # - principal: "gmsaDragon$"
-    #   target: "drogon"
-    #   right: "GenericAll"
+    # khal.drogo GenericAll on ESC4 certificate template — enables shadow credentials ESC4 attack
+    # The ESC4 template is in the Configuration NC (not domain NC)
+    # Full DN: CN=ESC4,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=essos,DC=local
+    # skip_missing_target: ADCS must be installed on braavos before this ACE can be applied
+    - principal: "khal.drogo"
+      target: "CN=ESC4,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=essos,DC=local"
+      target_type: "container"
+      right: "GenericAll"
+      skip_missing_target: true
+    # gMSA ACL: gmsaDragon$ has GenericAll on drogon — enables gMSA→drogon→Dragons→DA chain
+    # skip_missing_principal: true allows this to gracefully skip if gMSA hasn't been created yet
+    - principal: "gmsaDragon$"
+      target: "drogon"
+      right: "GenericAll"
+      skip_missing_principal: true
+    # drogon has adminCount=1 (member of DA via nesting) — SDPROP resets drogon's ACL.
+    # Also set on AdminSDHolder so SDPROP propagates gmsaDragon's GenericAll back to drogon.
+    - principal: "gmsaDragon$"
+      target: "CN=AdminSDHolder,CN=System"
+      target_type: "container"
+      right: "GenericAll"
+      skip_missing_principal: true

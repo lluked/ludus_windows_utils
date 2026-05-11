@@ -75,34 +75,51 @@
         [String]$RemoteAdminPassword
       )
 
-      # Build local credential and get local forest via explicit context
-      $localSecPwd = ConvertTo-SecureString $LocalAdminPassword -AsPlainText -Force
-      $localCred = New-Object System.Management.Automation.PSCredential("$LocalDomain\$LocalAdmin", $localSecPwd)
-
-      $localContext = New-Object -TypeName "System.DirectoryServices.ActiveDirectory.DirectoryContext" `
-        -ArgumentList @("Forest", $LocalDomain, "$LocalDomain\$LocalAdmin", $LocalAdminPassword)
-      $localForest = [System.DirectoryServices.ActiveDirectory.Forest]::getForest($localContext)
-
-      # Check if trust already exists
-      try {
-        $localForest.GetTrustRelationship($RemoteForest)
-        Write-Output "Trust with $RemoteForest already exists"
+      # First check if trust already exists via netdom (more reliable on Win2022)
+      $netdomOut = netdom query trust /d:$LocalDomain 2>&1 | Out-String
+      if ($netdomOut -match [regex]::Escape($RemoteForest)) {
+        Write-Output "Trust with $RemoteForest already exists (netdom check)"
         $Ansible.Changed = $false
         return
-      } catch [System.DirectoryServices.ActiveDirectory.ActiveDirectoryObjectNotFoundException] {
-        # Trust doesn't exist, proceed to create it
       }
 
-      # Build remote forest context
-      $remoteContext = New-Object -TypeName "System.DirectoryServices.ActiveDirectory.DirectoryContext" `
-        -ArgumentList @("Forest", $RemoteForest, $RemoteAdmin, $RemoteAdminPassword)
-      $distantForest = [System.DirectoryServices.ActiveDirectory.Forest]::getForest($remoteContext)
+      # Trust does not exist — create it via .NET DirectoryServices
+      # Wrap in try/catch to handle Win2022 transient AccessViolation on re-runs
+      try {
+        $localContext = New-Object -TypeName "System.DirectoryServices.ActiveDirectory.DirectoryContext" `
+          -ArgumentList @("Forest", $LocalDomain, "$LocalDomain\$LocalAdmin", $LocalAdminPassword)
+        $localForest = [System.DirectoryServices.ActiveDirectory.Forest]::getForest($localContext)
 
-      # Create bidirectional trust
-      $localForest.CreateTrustRelationship($distantForest, "Bidirectional")
-      Write-Output "Created bidirectional trust: $LocalDomain <-> $RemoteForest"
-      $Ansible.Changed = $true
-    error_action: stop
+        # Double-check via .NET (trust may have replicated since netdom check)
+        try {
+          $localForest.GetTrustRelationship($RemoteForest)
+          Write-Output "Trust with $RemoteForest already exists (.NET check)"
+          $Ansible.Changed = $false
+          return
+        } catch [System.DirectoryServices.ActiveDirectory.ActiveDirectoryObjectNotFoundException] {
+          # Trust doesn't exist, proceed to create it
+        }
+
+        # Build remote forest context
+        $remoteContext = New-Object -TypeName "System.DirectoryServices.ActiveDirectory.DirectoryContext" `
+          -ArgumentList @("Forest", $RemoteForest, $RemoteAdmin, $RemoteAdminPassword)
+        $distantForest = [System.DirectoryServices.ActiveDirectory.Forest]::getForest($remoteContext)
+
+        # Create bidirectional trust
+        $localForest.CreateTrustRelationship($distantForest, "Bidirectional")
+        Write-Output "Created bidirectional trust: $LocalDomain <-> $RemoteForest"
+        $Ansible.Changed = $true
+      } catch {
+        # On Win2022 the .NET DirectoryServices call can throw AccessViolationException
+        # even when the trust exists or was created successfully. Re-verify with netdom.
+        $verifyOut = netdom query trust /d:$LocalDomain 2>&1 | Out-String
+        if ($verifyOut -match [regex]::Escape($RemoteForest)) {
+          Write-Output "Trust creation .NET error but trust verified via netdom: $($_.Exception.Message)"
+          $Ansible.Changed = $false
+        } else {
+          throw "Failed to create trust $LocalDomain <-> $RemoteForest : $($_.Exception.Message)"
+        }
+      }
     parameters:
       LocalDomain: "{{ ludus_domain_fqdn }}"
       LocalAdmin: "{{ ludus_trust_domain_admin }}"
@@ -118,6 +135,49 @@
     post_reboot_delay: 30
     test_command: "Get-ADUser -Identity Administrator -Properties *"
   when: trust_result.changed | default(false)
+
+- name: Wait for cross-forest ADWS connectivity after reboot
+  ansible.windows.win_powershell:
+    script: |
+      [CmdletBinding()]
+      param (
+        [String]$PartnerDcIp,
+        [String]$PartnerAdminPassword,
+        [String]$RemoteForest
+      )
+
+      # After a reboot following trust creation, the cross-forest ADWS link
+      # may take time to become available. Probe with explicit credentials
+      # before attempting Add-ADGroupMember on cross-forest objects.
+      $timeout = 180
+      $timer   = [System.Diagnostics.Stopwatch]::StartNew()
+      $remoteCred = New-Object System.Management.Automation.PSCredential(
+        "$RemoteForest\Administrator",
+        (ConvertTo-SecureString $PartnerAdminPassword -AsPlainText -Force)
+      )
+
+      while ($timer.Elapsed.TotalSeconds -lt $timeout) {
+        try {
+          Get-ADObject -LDAPFilter "(objectClass=domain)" -Server $PartnerDcIp -Credential $remoteCred -ErrorAction Stop | Out-Null
+          Write-Output "Cross-forest ADWS reachable after $([int]$timer.Elapsed.TotalSeconds)s"
+          $Ansible.Changed = $false
+          return
+        } catch {
+          Start-Sleep -Seconds 10
+        }
+      }
+
+      Write-Output "Warning: cross-forest ADWS not confirmed after ${timeout}s — proceeding anyway"
+      $Ansible.Changed = $false
+    parameters:
+      PartnerDcIp: "{{ ludus_trust_partner_dc_ip }}"
+      PartnerAdminPassword: "{{ ludus_trust_domain_admin_password }}"
+      RemoteForest: "{{ ludus_trust_partner_domain }}"
+  when: >
+    trust_result.changed | default(false) and
+    ludus_cross_domain_group_members is defined and
+    ludus_cross_domain_group_members | length > 0
+  changed_when: false
 
 # ============================================================
 # SID History — no become needed, netdom runs as connected user
@@ -179,7 +239,9 @@
       [CmdletBinding()]
       param (
         [String]$GroupName,
-        [String[]]$Members
+        [String[]]$Members,
+        [String]$PartnerDcIp,
+        [String]$PartnerAdminPassword
       )
 
       Import-Module ActiveDirectory
@@ -187,47 +249,73 @@
       $changed = $false
       foreach ($member in $Members) {
         try {
-          # Parse DOMAIN\user or domain/user format to extract domain and username
           $memberObj = $null
           if ($member -match '^(.+?)\\(.+)$') {
             $memberDomain = $Matches[1]
             $memberName   = $Matches[2]
-            # Resolve the domain FQDN from the NetBIOS name if needed
-            try {
-              $domainFqdn = (Get-ADDomain -Identity $memberDomain -ErrorAction SilentlyContinue).DNSRoot
-            } catch { $domainFqdn = $null }
-            # Try to find the DC for this domain via DNS
-            $dcForDomain = $memberDomain
-            if ($domainFqdn) { $dcForDomain = $domainFqdn }
 
-            # Fetch the object from its own domain DC
+            # Determine whether this member is local or from the partner domain
+            $localDomainFqdn  = (Get-ADDomain -ErrorAction SilentlyContinue).DNSRoot
+            $memberDomainFqdn = $memberDomain
             try {
-              $memberObj = Get-ADObject -Filter "SamAccountName -eq '$memberName'" -Server $dcForDomain -ErrorAction Stop | Select-Object -First 1
-            } catch {
-              # Fallback: try as user, then group
-              try { $memberObj = Get-ADUser -Identity $memberName -Server $dcForDomain -ErrorAction Stop } catch {}
-              if (-not $memberObj) {
-                try { $memberObj = Get-ADGroup -Identity $memberName -Server $dcForDomain -ErrorAction Stop } catch {}
+              $resolved = (Get-ADDomain -Identity $memberDomain -ErrorAction SilentlyContinue).DNSRoot
+              if ($resolved) { $memberDomainFqdn = $resolved }
+            } catch {}
+
+            $isLocalDomain = ($memberDomainFqdn -ieq $localDomainFqdn)
+
+            if ($isLocalDomain) {
+              # Local domain — no special credentials needed
+              try {
+                $memberObj = Get-ADUser -Identity $memberName -ErrorAction Stop
+              } catch {
+                try {
+                  $memberObj = Get-ADGroup -Identity $memberName -ErrorAction Stop
+                } catch {
+                  Write-Output "Warning: could not find local $memberName : $($_.Exception.Message)"
+                }
+              }
+            } else {
+              # Foreign domain — use partner DC IP and explicit admin credentials
+              $remoteServer = $PartnerDcIp
+              $remoteSecPwd = ConvertTo-SecureString $PartnerAdminPassword -AsPlainText -Force
+              $remoteCred   = New-Object System.Management.Automation.PSCredential(
+                "$memberDomainFqdn\Administrator", $remoteSecPwd
+              )
+
+              # Fetch object from foreign DC with explicit credentials (cross-forest ADWS requires auth)
+              try {
+                $memberObj = Get-ADUser -Identity $memberName -Server $remoteServer -Credential $remoteCred -ErrorAction Stop
+              } catch {
+                try {
+                  $memberObj = Get-ADGroup -Identity $memberName -Server $remoteServer -Credential $remoteCred -ErrorAction Stop
+                } catch {
+                  Write-Output "Warning: could not find $memberName on $remoteServer : $($_.Exception.Message)"
+                }
               }
             }
           }
 
-          # Check if already a member (using the group's Member property to avoid GC lookup errors)
+          # Check if already a member via FSP DistinguishedName in local group
           $grp = Get-ADGroup $GroupName -Properties Members -ErrorAction SilentlyContinue
           $alreadyMember = $false
           if ($grp -and $memberObj) {
-            $alreadyMember = $grp.Members -contains $memberObj.DistinguishedName
+            # FSPs appear as S-1-5-... CN objects; match by SID embedded in DN or by objectGUID
+            $alreadyMember = $grp.Members | Where-Object { $_ -like "*$($memberObj.SID)*" }
+            if (-not $alreadyMember) {
+              # Also try direct DN match (for same-forest objects)
+              $alreadyMember = $grp.Members -contains $memberObj.DistinguishedName
+            }
           }
 
           if (-not $alreadyMember) {
             if ($memberObj) {
               Add-ADGroupMember -Identity $GroupName -Members $memberObj -ErrorAction Stop
+              Write-Output "Added $member to $GroupName"
+              $changed = $true
             } else {
-              # Fallback to string-based add
-              Add-ADGroupMember -Identity $GroupName -Members $member -ErrorAction Stop
+              Write-Output "Warning: skipping $member — object not found in remote domain"
             }
-            Write-Output "Added $member to $GroupName"
-            $changed = $true
           } else {
             Write-Output "$member is already a member of $GroupName"
           }
@@ -246,6 +334,8 @@
     parameters:
       GroupName: "{{ item.group }}"
       Members: "{{ item.members }}"
+      PartnerDcIp: "{{ ludus_trust_partner_dc_ip }}"
+      PartnerAdminPassword: "{{ ludus_trust_domain_admin_password }}"
   loop: "{{ ludus_cross_domain_group_members | default([]) }}"
   loop_control:
     label: "{{ item.group }}"

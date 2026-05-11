@@ -87,8 +87,15 @@ ludus_webclient_enabled: false
 ludus_lsa_ppl_enabled: false
 
 # ============================================================================
-# AUTOLOGON SETTINGS
+# ADCS ESC10 — KDC-side registry changes (must run on DC, not CA server)
 # ============================================================================
+
+# ESC10 Case 1: Disable StrongCertificateBindingEnforcement on the KDC
+# Allows certificate-to-account mapping without strong binding enforcement
+ludus_adcs_esc10_kdc: false
+
+# Disable Windows Defender real-time protection (for exploitation practice)
+ludus_windows_defender_disabled: false
 
 # Configure automatic login for a user
 # Useful for simulating logged-in users for credential harvesting
@@ -325,6 +332,10 @@ ludus_goad_misconfigs:
         allowed_to_delegate:
           - "CIFS/winterfell.north.sevenkingdoms.local"
           - "CIFS/winterfell"
+    # CASTELBLACK$ kerb-only constrained delegation.
+    # NOTE: This is set here on DC02 (winterfell) as it requires AD PowerShell (RSAT).
+    # However, SRV02's domain join recreates CASTELBLACK$ and wipes this setting.
+    # post_deploy_fix.py re-applies it after the domain join completes.
     constrained_delegation_kerb_only:
       - name: "CASTELBLACK$"
         domain: "north.sevenkingdoms.local"
@@ -359,7 +370,7 @@ ludus_goad_misconfigs:
     gpo_abuse:
       enabled: true
       name: "StarkWallpaper"
-      link_target: "OU=Domain Controllers,DC=north,DC=sevenkingdoms,DC=local"
+      link_target: "DC=north,DC=sevenkingdoms,DC=local"
       editors:
         - name: "samwell.tarly"
           permission: "GpoEditDeleteModifySecurity"
@@ -373,6 +384,10 @@ ludus_goad_misconfigs:
     smb_signing_disabled: true
     print_spooler_enabled: true
     webclient_enabled: true
+    # ESC10 KDC registry changes — must be on the DC, not the CA server
+    # Case 1: Disable StrongCertificateBindingEnforcement for ESC10 Case 1
+    # Case 2: Enable UPN mapping (CertificateMappingMethods = 0x4) for ESC10 Case 2
+    adcs_esc10_kdc: true
     local_groups:
       - group: "Administrators"
         members:
@@ -420,6 +435,8 @@ ludus_goad_misconfigs:
     smb_signing_disabled: true
     print_spooler_enabled: true
     webclient_enabled: true
+    # Upstream GOAD places castelblack in [defender_off] inventory group
+    windows_defender_disabled: true
     local_groups:
       - group: "Administrators"
         members:
@@ -429,6 +446,10 @@ ludus_goad_misconfigs:
           - "NORTH\\Night Watch"
           - "NORTH\\Mormont"
           - "NORTH\\Stark"
+    # NOTE: CASTELBLACK$ kerb-only constrained delegation cannot be set from SRV02
+    # because member servers lack RSAT-AD-PowerShell. The winterfell (DC02) profile
+    # sets it, but SRV02's domain join recreates the computer object and wipes it.
+    # This is handled by post_deploy_fix.py → fix_castelblack_delegation().
 
   # ========================================
   # SRV03 (braavos) - essos.local member
