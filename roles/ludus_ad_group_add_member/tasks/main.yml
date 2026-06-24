@@ -1,6 +1,6 @@
 ---
 
-- name: Add member to group
+- name: Add members to groups
   microsoft.ad.group:
     name: "{{ item.parent_group }}"
     path: "{{ item.path if item.path | default('') != '' else omit }}"
