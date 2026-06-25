@@ -15,8 +15,5 @@ galaxy_info:
     - windows
     - active_directory
     - ludus
-    - gmsa
-    - dsc
-    - service_account
 
 dependencies: []
